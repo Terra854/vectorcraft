@@ -1,6 +1,6 @@
 use super::ops::MAX_DATA;
 use super::{DictRef, ImageBlob, Key, Obj, PsError, Rc, RefCell, Res, find, hex_decode, jpeg_components, ps, ps_err};
-use craft_stream_codecs::CcittParams;
+use craft_stream_codecs::{CcittParams, CodecError, runlength};
 
 /// A file object: the program itself, or data a filter decoded.
 #[derive(Debug)]
@@ -26,29 +26,11 @@ pub(super) fn io<T>(at: &str) -> Res<T> {
 }
 
 /// The bytes `RunLengthDecode` makes of `raw`, and how many it read.
-fn run_length(raw: &[u8]) -> Res<(Vec<u8>, usize)> {
-    let mut out = vec![];
-    let mut i = 0;
-    while let Some(&n) = raw.get(i) {
-        i += 1;
-        match n {
-            128 => break,
-            0..=127 => {
-                let len = usize::from(n) + 1;
-                out.extend_from_slice(raw.get(i..i + len).ok_or(PsError::Ps("ioerror", "RunLengthDecode".into()))?);
-                i += len;
-            }
-            _ => {
-                let b = *raw.get(i).ok_or(PsError::Ps("ioerror", "RunLengthDecode".into()))?;
-                i += 1;
-                out.extend(std::iter::repeat_n(b, 257 - usize::from(n)));
-            }
-        }
-        if out.len() > MAX_DATA {
-            return Err(PsError::Limit("decoded data is too large"));
-        }
-    }
-    Ok((out, i))
+fn run_length(raw: &[u8], max: usize) -> Res<(Vec<u8>, usize)> {
+    runlength::decode_prefix(raw, max).map_err(|failure| match failure.error {
+        CodecError::LimitExceeded(_) => PsError::Limit("decoded data is too large"),
+        _ => PsError::Ps("ioerror", "RunLengthDecode".into()),
+    })
 }
 
 /// zlib data inflated, and how many bytes of `raw` it took.
@@ -399,7 +381,7 @@ pub(super) fn decode(f: &Filter, raw: &[u8]) -> Res<(Vec<u8>, usize, Option<u8>)
             text.push_str("~>");
             (ps::ascii85_decode(&text).ok_or(PsError::Ps("ioerror", "ASCII85Decode".into()))?, end.map_or(raw.len(), |e| e + 2))
         }
-        "RunLengthDecode" => run_length(raw)?,
+        "RunLengthDecode" => run_length(raw, MAX_DATA)?,
         "FlateDecode" | "LZWDecode" => {
             let (data, used) = if &*f.name == "FlateDecode" { flate(raw)? } else { lzw(raw)? };
             match f.predictor {
@@ -440,4 +422,20 @@ pub(super) fn decode(f: &Filter, raw: &[u8]) -> Res<(Vec<u8>, usize, Option<u8>)
         other => return ps_err("undefined", other),
     };
     Ok((data, used, None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runlength_packet_errors_keep_the_eps_limit_and_precedence() {
+        let corrupt = PsError::Ps("ioerror", "RunLengthDecode".into());
+        let limit = PsError::Limit("decoded data is too large");
+        assert_eq!(run_length(&[], 0), Ok((vec![], 0)));
+        assert_eq!(run_length(&[0, b'a'], 1), Ok((vec![b'a'], 2)));
+        assert_eq!(run_length(&[3, b'a', b'b'], 1), Err(corrupt.clone()));
+        assert_eq!(run_length(&[254], 0), Err(corrupt));
+        assert_eq!(run_length(&[254, b'a', 127], 2), Err(limit));
+    }
 }

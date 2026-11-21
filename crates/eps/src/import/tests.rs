@@ -1195,6 +1195,22 @@ fn flushfile_skips_the_data_of_a_filter() {
     blue("currentfile 0 (%%EndPacket) /SubFileDecode filter flushfile\n<?xml version=\"1.0\"?><x a=\"(\"/>\n%%EndPacket\n0 0 1 setrgbcolor");
 }
 
+#[test]
+fn runlength_keeps_postscript_after_its_end_marker() {
+    // Generate the original binary fixture in memory so currentfile sees the raw EOD byte.
+    let mut program = b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 100 100\n%%EndComments\n\
+                        currentfile /RunLengthDecode filter 6 string readstring\n"
+        .to_vec();
+    program.extend_from_slice(&[2, b'a', b'b', b'c', 254, b'x', 128]);
+    program.extend_from_slice(b"\npop (abcxxx) eq { 0 0 10 10 rectfill } if\nshowpage\n%%EOF\n");
+
+    let imported = import(&program).unwrap();
+    assert!(imported.warnings.is_empty(), "{:?}", imported.warnings);
+    let drawn = objects(&imported.document);
+    assert_eq!(drawn.len(), 1);
+    assert!(matches!(drawn[0].kind, NodeKind::Path { .. }));
+}
+
 /// Executable files are untrusted programs too: running one inside itself stops at the nesting
 /// limit, and the program's own file runs once. Type laid out in a loop (`cshow` on a long
 /// string, `stringwidth` in `loop`) counts against the operation budget like the loop itself.
